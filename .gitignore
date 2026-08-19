@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Secrets
+.env
+
+# Eval runtime outputs (generated per-run, not source-controlled)
+evals/*/generated/
+evals/*/report.html
+
+# Legacy paths (kept for safety in case of stale clones)
+generated/
+report.html
