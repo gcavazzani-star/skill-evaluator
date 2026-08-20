@@ -5,12 +5,14 @@ Usage:
     python run_eval.py --skill modelagem-conceitual
     python run_eval.py --skill minha-skill --tc TC01
     python run_eval.py --skill minha-skill --workers 2 --no-browser --no-summary
+    python run_eval.py --skill minha-skill --runs 3   # N runs per TC, reports mean±stddev
 """
 import os
 import sys
 import json
 import re
 import time
+import hashlib
 import threading
 import concurrent.futures
 import webbrowser
@@ -30,8 +32,8 @@ from scorer import score as judge_score, _call_with_retry
 
 load_dotenv()
 
-BASE_URL = os.environ.get("ANTHROPIC_BASE_URL")
-TOKEN    = os.environ.get("ANTHROPIC_API_KEY")
+BASE_URL    = os.environ.get("ANTHROPIC_BASE_URL")
+TOKEN       = os.environ.get("ANTHROPIC_API_KEY")
 MODEL       = os.environ.get("SKILL_MODEL", "anthropic.claude-4-6-sonnet")
 JUDGE_MODEL = os.environ.get("JUDGE_MODEL", MODEL)
 
@@ -78,7 +80,6 @@ def load_rubric(skill: str) -> dict:
 
 
 def build_criteria_descriptions(rubric: dict) -> dict:
-    """Build {criterion_id: description} from rubric for HTML rendering."""
     desc = {}
     for block in rubric.get("generate_blocks", []):
         for c in block.get("criteria", []):
@@ -117,6 +118,52 @@ def run_skill(client: Anthropic, system_prompt: str, input_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Judge cache — hash(judge_model + tc_id + rubric_sig + output) → scoring
+# ---------------------------------------------------------------------------
+
+def _cache_key(tc_id: str, output: str, jmodel: str, rubric: dict) -> str:
+    rubric_sig = json.dumps(
+        {
+            "blocks":  [b["id"] for b in rubric.get("generate_blocks", [])],
+            "reject":  sorted(rubric.get("reject_criteria", {}).keys()),
+        },
+        sort_keys=True,
+    )
+    payload = f"{jmodel}|{tc_id}|{rubric_sig}|{output}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_judge_cache(eval_dir: Path) -> dict:
+    path = eval_dir / ".judge_cache.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_judge_cache(eval_dir: Path, cache: dict) -> None:
+    path = eval_dir / ".judge_cache.json"
+    path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Verbosity bias — Pearson correlation of output length vs score
+# ---------------------------------------------------------------------------
+
+def _pearson(xs: list, ys: list) -> float:
+    n = len(xs)
+    if n < 3:
+        return 0.0
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    den = (sum((x - mx) ** 2 for x in xs) * sum((y - my) ** 2 for y in ys)) ** 0.5
+    return num / den if den > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
 # Agent summary
 # ---------------------------------------------------------------------------
 
@@ -136,9 +183,10 @@ def generate_agent_summary(client: Anthropic, results: list) -> str:
             f"{b['id']}:{round(sum(c['score'] for c in b['criteria']) / (len(b['criteria']) * 10) * 100)}"
             for b in blocks if b.get("criteria")
         )
+        stddev_info = f" ±{r['stddev']}" if r.get("stddev", 0) > 0 else ""
         snippet = r["scoring"].get("summary", "")[:400]
         lines.append(
-            f"- {tc['id']} ({tc['type']}): {r['verdict']} score={r['score']}/100"
+            f"- {tc['id']} ({tc['type']}): {r['verdict']} score={r['score']}{stddev_info}/100"
             + (f" [{block_info}]" if block_info else "")
             + (f"\n  judge: {snippet}" if snippet else "")
         )
@@ -236,7 +284,7 @@ def _md_to_html(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Per-TC runner
+# Per-TC runner (with cache + multi-run support)
 # ---------------------------------------------------------------------------
 
 def _run_one_tc(
@@ -249,46 +297,93 @@ def _run_one_tc(
     print_lock: threading.Lock,
     verbose: bool = False,
     judge_model: str = "",
+    cache: dict = None,
+    cache_lock: threading.Lock = None,
+    runs: int = 1,
 ) -> dict:
+    jmodel           = judge_model or JUDGE_MODEL
     input_text       = get_input_text(tc, eval_dir)
     expected_content = get_expected_content(tc, eval_dir)
-    output           = ""
-    t0               = time.monotonic()
+    all_scores   = []
+    all_scorings = []
+    all_outputs  = []
+    t0           = time.monotonic()
 
-    try:
-        output = run_skill(client, system_prompt, input_text)
-        (gen_dir / f"{tc['id']}_output.md").write_text(output, encoding="utf-8")
-        scoring = judge_score(
-            client, judge_model or JUDGE_MODEL, tc, input_text, output, rubric, expected_content
-        )
-    except anthropic.AuthenticationError:
-        raise
-    except Exception as exc:
-        scoring = {
-            "blocks":         [],
-            "weighted_score": 0,
-            "verdict":        "ERROR",
-            "summary":        f"{type(exc).__name__}: {exc}",
-        }
+    for _ in range(runs):
+        output  = ""
+        scoring = {}
+        try:
+            output  = run_skill(client, system_prompt, input_text)
+            ck      = _cache_key(tc["id"], output, jmodel, rubric)
+            cached  = cache is not None and ck in cache
 
-    elapsed = round(time.monotonic() - t0, 1)
-    sc      = int(round(scoring.get("weighted_score", 0)))
-    verdict = scoring.get("verdict", "ERROR")
-    symbol  = "OK" if verdict == "PASS" else ("!!" if verdict == "ERROR" else "XX")
+            if cached:
+                scoring = cache[ck]
+            else:
+                scoring = judge_score(
+                    client, jmodel, tc, input_text, output, rubric, expected_content
+                )
+                if cache is not None and cache_lock is not None and scoring.get("verdict") != "ERROR":
+                    with cache_lock:
+                        cache[ck] = scoring
+
+        except anthropic.AuthenticationError:
+            raise
+        except Exception as exc:
+            scoring = {
+                "blocks":         [],
+                "weighted_score": 0,
+                "verdict":        "ERROR",
+                "summary":        f"{type(exc).__name__}: {exc}",
+            }
+            cached = False
+
+        sc = int(round(scoring.get("weighted_score", 0)))
+        all_scores.append(sc)
+        all_scorings.append(scoring)
+        all_outputs.append(output)
+
+    elapsed   = round(time.monotonic() - t0, 1)
+    mean_sc   = round(sum(all_scores) / len(all_scores))
+    stddev    = round(
+        (sum((s - mean_sc) ** 2 for s in all_scores) / len(all_scores)) ** 0.5, 1
+    ) if runs > 1 else 0.0
+
+    # Best output = highest scored run (for display)
+    best_idx  = all_scores.index(max(all_scores))
+    best_out  = all_outputs[best_idx]
+    best_sc   = all_scorings[best_idx]
+
+    error_count = sum(1 for s in all_scorings if s.get("verdict") == "ERROR")
+    if error_count == runs:
+        verdict = "ERROR"
+    elif mean_sc >= 80:
+        verdict = "PASS"
+    else:
+        verdict = "FAIL"
+
+    symbol = "OK" if verdict == "PASS" else ("!!" if verdict == "ERROR" else "XX")
+    cached_tag = " [cached]" if runs == 1 and cache is not None and _cache_key(tc["id"], best_out, jmodel, rubric) in cache else ""
 
     with print_lock:
-        print(f"  [{tc['id']}] [{symbol}] {sc:3d}/100  {verdict}  ({elapsed}s)")
+        stddev_str = f" ±{stddev}" if stddev > 0 else ""
+        print(f"  [{tc['id']}] [{symbol}] {mean_sc:3d}{stddev_str}/100  {verdict}  ({elapsed}s){cached_tag}")
         if verbose and verdict == "ERROR":
-            print(f"         {scoring.get('summary', '')[:120]}")
+            print(f"         {best_sc.get('summary', '')[:120]}")
+
+    (gen_dir / f"{tc['id']}_output.md").write_text(best_out, encoding="utf-8")
 
     return {
-        "tc":      tc,
-        "input":   input_text,
-        "output":  output,
-        "scoring": scoring,
-        "score":   sc,
-        "verdict": verdict,
-        "elapsed": elapsed,
+        "tc":         tc,
+        "input":      input_text,
+        "output":     best_out,
+        "output_len": len(best_out),
+        "scoring":    best_sc,
+        "score":      mean_sc,
+        "stddev":     stddev,
+        "scores":     all_scores,
+        "verdict":    verdict,
+        "elapsed":    elapsed,
     }
 
 
@@ -406,7 +501,7 @@ def _render_blocks(blocks: list, criteria_descriptions: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CSS / JS (identical to run_tests.py visual style)
+# CSS / JS
 # ---------------------------------------------------------------------------
 
 CSS = """
@@ -427,6 +522,11 @@ code { font-family: 'Cascadia Code','Fira Code','Courier New',monospace; }
 .kpi-value.green  { color: #3fb950; }
 .kpi-value.yellow { color: #d29922; }
 .kpi-value.red    { color: #f85149; }
+.warn-banner { margin: 1rem 2.5rem 0; padding: 0.75rem 1.1rem;
+               background: #2a1a00; border: 1px solid #4a3000;
+               border-left: 3px solid #d29922; border-radius: 8px;
+               font-size: 0.82rem; color: #e3b341; }
+.warn-banner strong { color: #f0c040; }
 .agent-section { padding: 1.25rem 2.5rem 0; }
 .agent-card { background: #161b27; border: 1px solid #30363d;
               border-left: 3px solid #58a6ff; border-radius: 10px;
@@ -471,6 +571,15 @@ tbody td { padding: 0.6rem 0.9rem; vertical-align: middle; }
 .mini-block  { font-size: 0.62rem; font-weight: 700; padding: 0.1rem 0.32rem;
                border-radius: 3px; letter-spacing: 0.02em; cursor: default; }
 .time-chip { font-size: 0.72rem; color: #484f58; font-variant-numeric: tabular-nums; }
+.delta { font-size: 0.68rem; font-weight: 700; margin-left: 0.4rem;
+         padding: 0.08rem 0.3rem; border-radius: 3px; font-variant-numeric: tabular-nums; }
+.delta.pos     { color: #3fb950; background: #0f2b1a; }
+.delta.neg     { color: #f85149; background: #2d1010; }
+.delta.neutral { color: #484f58; background: #161b27; }
+.stddev-chip { font-size: 0.65rem; color: #6e7681; margin-left: 0.25rem;
+               font-variant-numeric: tabular-nums; }
+.out-len-chip { font-size: 0.68rem; color: #484f58; padding: 0.08rem 0.3rem;
+                border-radius: 3px; background: #161b27; }
 .detail { display: none; background: #080d17; }
 .detail.open { display: block; }
 .detail-inner { padding: 1.5rem 2.5rem 2rem; border-top: 1px solid #21262d; }
@@ -498,6 +607,11 @@ tbody td { padding: 0.6rem 0.9rem; vertical-align: middle; }
 .sum-label   { font-size: 0.68rem; text-transform: uppercase;
                letter-spacing: 0.06em; color: #6e7681;
                display: block; margin-bottom: 0.35rem; }
+.runs-box { background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
+            padding: 0.6rem 1rem; margin-bottom: 1.25rem;
+            font-size: 0.78rem; color: #8b949e; }
+.runs-label { font-size: 0.68rem; text-transform: uppercase;
+              letter-spacing: 0.06em; color: #6e7681; display: block; margin-bottom: 0.25rem; }
 .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem;
                margin-bottom: 1.25rem; }
 @media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
@@ -526,11 +640,6 @@ pre.code { font-family: 'Cascadia Code','Fira Code',monospace; font-size: 0.73re
 .crit-text { display: flex; flex-direction: column; gap: 0.1rem; }
 .crit-desc { font-size: 0.73rem; color: #c9d1d9; }
 .crit-just { font-size: 0.7rem; color: #8b949e; font-style: italic; }
-.delta { font-size: 0.68rem; font-weight: 700; margin-left: 0.4rem;
-          padding: 0.08rem 0.3rem; border-radius: 3px; font-variant-numeric: tabular-nums; }
-.delta.pos     { color: #3fb950; background: #0f2b1a; }
-.delta.neg     { color: #f85149; background: #2d1010; }
-.delta.neutral { color: #484f58; background: #161b27; }
 .footer { text-align: center; padding: 2rem; font-size: 0.72rem; color: #21262d; }
 """
 
@@ -565,6 +674,8 @@ def generate_html(
     agent_summary: str = "",
     judge_model: str = "",
     history: dict = None,
+    verbosity_corr: float = 0.0,
+    runs: int = 1,
 ) -> str:
     total     = len(results)
     passed    = sum(1 for r in results if r["verdict"] == "PASS")
@@ -591,6 +702,17 @@ def generate_html(
     else:
         agent_section = ""
 
+    # Verbosity bias warning banner
+    verbosity_banner = ""
+    if abs(verbosity_corr) > 0.7 and gen_results:
+        direction = "mais longo = score maior" if verbosity_corr > 0 else "mais longo = score menor"
+        verbosity_banner = (
+            f'<div class="warn-banner">&#9888; <strong>Verbosity bias detectado</strong> '
+            f'— correlação comprimento/score = {verbosity_corr:.2f} ({direction}). '
+            f'O judge pode estar avaliando volume de texto, não qualidade. '
+            f'Considere calibrar a rubrica ou usar um judge model diferente.</div>'
+        )
+
     rows    = ""
     details = ""
 
@@ -598,7 +720,9 @@ def generate_html(
         tc      = r["tc"]
         verdict = r["verdict"]
         sc      = r["score"]
+        stddev  = r.get("stddev", 0.0)
         elapsed = r.get("elapsed", 0)
+        out_len = r.get("output_len", 0)
 
         badge      = f'<span class="badge {verdict.lower()}">{verdict}</span>'
         type_badge = (
@@ -609,6 +733,7 @@ def generate_html(
         block_pct = _block_pct_map(r["scoring"].get("blocks", []))
         mini_b    = _mini_blocks(tc.get("scoring_blocks", []), block_pct)
 
+        # Delta vs last run
         prev_score = (history or {}).get(tc["id"])
         if prev_score is not None and tc["type"] == "generate":
             delta = sc - prev_score
@@ -621,13 +746,18 @@ def generate_html(
         else:
             delta_html = ""
 
+        # Stddev chip
+        stddev_html = (
+            f'<span class="stddev-chip">±{stddev}</span>' if stddev > 0 else ""
+        )
+
         rows += (
             f'<tr class="tc-row" data-tc="{tc["id"]}">'
             f'<td><strong>{tc["id"]}</strong></td>'
             f'<td>{tc["description"]}</td>'
             f'<td>{type_badge}</td>'
             f'<td>{mini_b}</td>'
-            f'<td>{_bar(sc)}{delta_html}</td>'
+            f'<td>{_bar(sc)}{stddev_html}{delta_html}</td>'
             f'<td>{badge}</td>'
             f'<td><span class="time-chip">{elapsed}s</span></td>'
             f'</tr>'
@@ -660,6 +790,28 @@ def generate_html(
             if summary else ""
         )
 
+        # Multi-run distribution
+        all_scores = r.get("scores", [sc])
+        runs_html = ""
+        if len(all_scores) > 1:
+            score_pills = " ".join(
+                f'<span style="color:{"#3fb950" if s >= 80 else "#d29922" if s >= 50 else "#f85149"}">{s}</span>'
+                for s in all_scores
+            )
+            runs_html = (
+                f'<div class="runs-box">'
+                f'<span class="runs-label">Distribuição de {len(all_scores)} runs</span>'
+                f'Scores individuais: {score_pills} '
+                f'— média <strong>{sc}</strong>, desvio <strong>±{stddev}</strong>'
+                f'</div>'
+            )
+
+        # Output length chip
+        len_html = (
+            f'<span class="out-len-chip">{out_len:,} chars</span>'
+            if out_len else ""
+        )
+
         blocks_html = _render_blocks(r["scoring"].get("blocks", []), criteria_descriptions)
 
         details += f"""
@@ -667,6 +819,7 @@ def generate_html(
           <td colspan="7" style="padding:0;">
             <div class="detail-inner">
               {expected_html}
+              {runs_html}
               {bov_html}
               {summary_html}
               <div class="detail-grid">
@@ -675,7 +828,7 @@ def generate_html(
                   <div class="panel-body"><pre class="code">{inp_safe}</pre></div>
                 </div>
                 <div class="panel">
-                  <div class="panel-title">Output da Skill</div>
+                  <div class="panel-title">Output da Skill {len_html}</div>
                   <div class="panel-body"><pre class="code">{out_safe}</pre></div>
                 </div>
               </div>
@@ -710,6 +863,16 @@ def generate_html(
             f'</div></div>'
         )
 
+    judge_info = (
+        f' &nbsp;|&nbsp; Judge: <span style="color:#d29922">{judge_model}</span>'
+        if judge_model and judge_model != MODEL else ""
+    )
+    runs_kpi = (
+        f'<div class="kpi"><div class="kpi-label">Runs / TC</div>'
+        f'<div class="kpi-value" style="color:#e2e8f0;">{runs}</div></div>'
+        if runs > 1 else ""
+    )
+
     return f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -722,7 +885,7 @@ def generate_html(
 
 <div class="header">
   <h1>Skill Eval Report — {skill}</h1>
-  <div class="sub">Gerado em {timestamp} &nbsp;|&nbsp; Skill: {MODEL}{f' &nbsp;|&nbsp; Judge: <span style="color:#d29922">{judge_model}</span>' if judge_model and judge_model != MODEL else ''}</div>
+  <div class="sub">Gerado em {timestamp} &nbsp;|&nbsp; Skill: {MODEL}{judge_info}</div>
   <div class="kpi-row">
     <div class="kpi">
       <div class="kpi-label">Aprovados / Total</div>
@@ -730,6 +893,7 @@ def generate_html(
     </div>
     {gen_kpi}
     {rej_kpi}
+    {runs_kpi}
     <div class="kpi">
       <div class="kpi-label">TCs Executados</div>
       <div class="kpi-value" style="color:#e2e8f0;">{total}</div>
@@ -741,6 +905,7 @@ def generate_html(
   </div>
 </div>
 
+{verbosity_banner}
 {agent_section}
 
 <div class="table-wrap">
@@ -751,7 +916,7 @@ def generate_html(
         <th>Descrição</th>
         <th style="width:80px">Tipo</th>
         <th style="width:120px">Blocos</th>
-        <th style="width:180px">Score Total</th>
+        <th style="width:200px">Score Total</th>
         <th style="width:70px">Status</th>
         <th style="width:55px">Tempo</th>
       </tr>
@@ -783,6 +948,7 @@ def main():
     parser.add_argument("--skill",      required=True,      help="Nome da skill (ex: modelagem-conceitual)")
     parser.add_argument("--tc",         default="",         help="Rodar apenas um TC (ex: TC01)")
     parser.add_argument("--workers",    type=int, default=4, help="Workers paralelos (default: 4)")
+    parser.add_argument("--runs",       type=int, default=1, help="Runs por TC para medir variancia (default: 1)")
     parser.add_argument("--no-browser", action="store_true", help="Nao abre browser ao final")
     parser.add_argument("--verbose",    action="store_true", help="Imprime detalhe de erros inline")
     parser.add_argument("--no-summary", action="store_true", help="Pula analise do agente")
@@ -807,9 +973,9 @@ def main():
 
     gen_dir.mkdir(exist_ok=True)
 
-    rubric      = load_rubric(args.skill)
+    rubric        = load_rubric(args.skill)
     criteria_desc = build_criteria_descriptions(rubric)
-    test_cases  = json.loads((eval_dir / "test_cases.json").read_text(encoding="utf-8"))
+    test_cases    = json.loads((eval_dir / "test_cases.json").read_text(encoding="utf-8"))
 
     if args.tc:
         tc_id      = args.tc.upper()
@@ -821,21 +987,26 @@ def main():
     tc_order = {tc["id"]: i for i, tc in enumerate(test_cases)}
     workers  = min(args.workers, len(test_cases))
 
-    # Load last run from history for delta display
+    # Load history for delta display
     history_path = eval_dir / "history.jsonl"
     prev_scores: dict = {}
     if history_path.exists():
         try:
-            last_line = history_path.read_text(encoding="utf-8").strip().splitlines()[-1]
+            last_line   = history_path.read_text(encoding="utf-8").strip().splitlines()[-1]
             prev_scores = json.loads(last_line).get("tcs", {})
         except Exception:
             pass
+
+    # Load judge cache
+    cache      = _load_judge_cache(eval_dir)
+    cache_lock = threading.Lock()
 
     client        = build_client()
     system_prompt = build_system_prompt(args.skill)
 
     judge_label = f" | judge: {JUDGE_MODEL}" if JUDGE_MODEL != MODEL else ""
-    print(f"\nSkill Eval Runner — skill: {args.skill} | {len(test_cases)} TC(s) | modelo: {MODEL}{judge_label} | workers: {workers}")
+    runs_label  = f" | runs/TC: {args.runs}" if args.runs > 1 else ""
+    print(f"\nSkill Eval Runner — skill: {args.skill} | {len(test_cases)} TC(s) | modelo: {MODEL}{judge_label}{runs_label} | workers: {workers}")
     print("-" * 70)
 
     results    = []
@@ -845,7 +1016,8 @@ def main():
         future_to_tc = {
             executor.submit(
                 _run_one_tc, tc, client, system_prompt, rubric,
-                eval_dir, gen_dir, print_lock, args.verbose, JUDGE_MODEL
+                eval_dir, gen_dir, print_lock, args.verbose,
+                JUDGE_MODEL, cache, cache_lock, args.runs
             ): tc
             for tc in test_cases
         }
@@ -859,16 +1031,33 @@ def main():
                 sys.exit(1)
             except Exception as exc:
                 results.append({
-                    "tc":      tc,
-                    "input":   get_input_text(tc, eval_dir),
-                    "output":  "",
-                    "scoring": {"blocks": [], "weighted_score": 0, "verdict": "ERROR", "summary": str(exc)},
-                    "score":   0,
-                    "verdict": "ERROR",
-                    "elapsed": 0.0,
+                    "tc":         tc,
+                    "input":      get_input_text(tc, eval_dir),
+                    "output":     "",
+                    "output_len": 0,
+                    "scoring":    {"blocks": [], "weighted_score": 0, "verdict": "ERROR", "summary": str(exc)},
+                    "score":      0,
+                    "stddev":     0.0,
+                    "scores":     [0],
+                    "verdict":    "ERROR",
+                    "elapsed":    0.0,
                 })
 
     results.sort(key=lambda r: tc_order.get(r["tc"]["id"], 999))
+
+    # Verbosity bias correlation
+    gen_pairs = [
+        (r["output_len"], r["score"])
+        for r in results
+        if r["tc"]["type"] == "generate" and r["output_len"] > 0
+    ]
+    verbosity_corr = 0.0
+    if len(gen_pairs) >= 3:
+        lengths, scores_v = zip(*gen_pairs)
+        verbosity_corr = _pearson(list(lengths), list(scores_v))
+
+    # Save updated cache
+    _save_judge_cache(eval_dir, cache)
 
     print("-" * 70)
     passed   = sum(1 for r in results if r["verdict"] == "PASS")
@@ -879,7 +1068,10 @@ def main():
     gen_part = f"score geracao: {avg_gen}/100" if avg_gen is not None else ""
     rej_part = f"rejeicao: {rej_pass}/{len(rej_res)}" if rej_res else ""
     metrics  = " | ".join(p for p in [gen_part, rej_part] if p)
-    print(f"Resultado: {passed}/{len(results)} aprovados | {metrics}\n")
+    print(f"Resultado: {passed}/{len(results)} aprovados | {metrics}")
+    if abs(verbosity_corr) > 0.7:
+        print(f"AVISO verbosity bias: correlacao comprimento/score = {verbosity_corr:.2f}")
+    print()
 
     agent_summary = ""
     if not args.no_summary and results:
@@ -890,14 +1082,15 @@ def main():
     ts_iso  = datetime.now().isoformat(timespec="seconds")
     ts_disp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Persist run to history.jsonl (append)
-    if not args.tc:  # só salva histórico em runs completos
+    # Persist run to history.jsonl (full runs only)
+    if not args.tc:
         history_entry = {
             "ts":          ts_iso,
             "skill_model": MODEL,
             "judge_model": JUDGE_MODEL,
+            "runs":        args.runs,
             "tcs":         {r["tc"]["id"]: r["score"] for r in results},
-            "avg_gen":     round(sum(r["score"] for r in gen_res) / len(gen_res)) if gen_res else None,
+            "avg_gen":     avg_gen,
             "rej_pass":    rej_pass,
             "rej_total":   len(rej_res),
         }
@@ -909,6 +1102,8 @@ def main():
         results, ts_disp, args.skill, criteria_desc, agent_summary,
         judge_model=JUDGE_MODEL,
         history=prev_scores if not args.tc else None,
+        verbosity_corr=verbosity_corr,
+        runs=args.runs,
     )
     report_path = eval_dir / "report.html"
     report_path.write_text(html, encoding="utf-8")
@@ -917,7 +1112,6 @@ def main():
     if not args.no_browser:
         webbrowser.open(report_path.as_uri())
 
-    # Exit code non-zero for CI gates
     if passed < len(results):
         sys.exit(1)
 

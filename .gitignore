@@ -11,6 +11,8 @@ __pycache__/
 # Eval runtime outputs (generated per-run, not source-controlled)
 evals/*/generated/
 evals/*/report.html
+evals/*/history.jsonl
+evals/*/.judge_cache.json
 
 # Legacy paths (kept for safety in case of stale clones)
 generated/
