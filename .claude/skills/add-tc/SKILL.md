@@ -62,7 +62,7 @@ Read("evals/<skill>/rubric.json")
 
 Extraia:
 - IDs de todos os `generate_blocks` (ex: E, C, X, Q, P)
-- Chaves de todos os `reject_criteria` (ex: B1, B2, B7)
+- Chaves de todos os `reject_criteria` (ex: R1, R2, R3)
 
 O novo TC só pode referenciar blocos e critérios que existem na rubrica.
 
@@ -94,7 +94,7 @@ Crie o conteúdo do arquivo de input adequado ao cenário:
 - O input deve ser realista — use o mesmo formato e estilo dos inputs existentes
 - Controle o que está presente vs ausente vs ambíguo para exercitar os critérios selecionados
 - Se o TC testa extração de entidades, garanta que as entidades estejam no input
-- Se o TC testa tratamento de `[ausente]`, omita informações intencionalmente
+- Se o TC testa como a skill trata informação ausente, omita campos intencionalmente
 
 **Para TCs de rejeição:**
 - Se o input é curto (< 3 linhas), use `prompt` diretamente em test_cases.json
@@ -120,12 +120,12 @@ Escreva uma descrição clara do comportamento esperado da skill dado este input
 
 Para TCs de geração, o `expected_behavior` deve especificar:
 - O que o output DEVE conter (entidades, regras, seções)
-- O que o output NÃO deve conter (informações inventadas, [ausente] indevidos)
-- Qualquer comportamento específico deste cenário (ex: marcação [ambíguo] para conflito X)
+- O que o output NÃO deve conter (informações inventadas, inferências não suportadas pelo input)
+- Qualquer comportamento específico deste cenário (ex: como a skill sinaliza conflitos ou ausências)
 
 Para TCs de rejeição, o `expected_behavior` deve especificar:
 - Que a skill NÃO gera documento
-- O que a skill DEVE fazer em vez disso (pedir contexto, redirecionar, perguntar por qual produto começar)
+- O que a skill DEVE fazer em vez disso (pedir contexto, redirecionar, declinar com instrução clara)
 
 ### Passo 8 — Montar a entrada em test_cases.json
 
@@ -150,7 +150,7 @@ Para TCs sem arquivo (input inline):
   "type": "reject",
   "prompt": "<texto do prompt inline>",
   "expected_behavior": "...",
-  "scoring_blocks": ["B1"]
+  "scoring_blocks": ["R1"]
 }
 ```
 

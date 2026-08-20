@@ -151,7 +151,7 @@ Com base nos dados coletados, produza o diagnóstico no formato abaixo.
 
 1. [Ação concreta — ex: "Adicionar ao SKILL.md, seção Passo 3, a instrução explícita de que..."]
 2. [Ação concreta — ex: "Reformular critério X2 da rubrica de '...' para '...' para reduzir ambiguidade"]
-3. [Ação concreta — ex: "Adicionar ao input a informação Y que está ausente e causa o campo [ausente] indevido"]
+3. [Ação concreta — ex: "Adicionar ao input a informação Y que está ausente e impede a avaliação correta do critério X"]
 ```
 
 ---
