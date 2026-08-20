@@ -94,3 +94,19 @@ PASS if judge_score >= 8
 Blocks with `binary: true` in the rubric: any criterion violation → 0 for the entire block.
 
 Report metrics are separated by type — generation score (0–100) and rejection rate (count/total) are never averaged together.
+
+---
+
+## Navigation Rules
+
+Before acting on any task in this project, consult the relevant rule file in `.claude/rules/`:
+
+| File | When to use |
+|---|---|
+| `skill-navigation.md` | Working with SKILL.md, examples.md, patterns.md |
+| `eval-navigation.md` | Creating or modifying rubric.json, test_cases.json, inputs, expected |
+| `find-patterns.md` | Quick reference — Glob/Grep/Read patterns for anything in this project |
+| `before-edit-framework.md` | Modifying run_eval.py or scorer.py |
+| `read-results.md` | Interpreting scores, trends, generated outputs, or judge cache |
+
+Each rule file specifies the exact tool calls to make and what to look for in the results.
