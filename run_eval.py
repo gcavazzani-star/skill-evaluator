@@ -32,7 +32,8 @@ load_dotenv()
 
 BASE_URL = os.environ.get("ANTHROPIC_BASE_URL")
 TOKEN    = os.environ.get("ANTHROPIC_API_KEY")
-MODEL    = os.environ.get("SKILL_MODEL", "anthropic.claude-4-6-sonnet")
+MODEL       = os.environ.get("SKILL_MODEL", "anthropic.claude-4-6-sonnet")
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", MODEL)
 
 BASE_DIR  = Path(__file__).parent
 EVALS_DIR = BASE_DIR / "evals"
@@ -247,6 +248,7 @@ def _run_one_tc(
     gen_dir: Path,
     print_lock: threading.Lock,
     verbose: bool = False,
+    judge_model: str = "",
 ) -> dict:
     input_text       = get_input_text(tc, eval_dir)
     expected_content = get_expected_content(tc, eval_dir)
@@ -257,7 +259,7 @@ def _run_one_tc(
         output = run_skill(client, system_prompt, input_text)
         (gen_dir / f"{tc['id']}_output.md").write_text(output, encoding="utf-8")
         scoring = judge_score(
-            client, MODEL, tc, input_text, output, rubric, expected_content
+            client, judge_model or JUDGE_MODEL, tc, input_text, output, rubric, expected_content
         )
     except anthropic.AuthenticationError:
         raise
@@ -524,6 +526,11 @@ pre.code { font-family: 'Cascadia Code','Fira Code',monospace; font-size: 0.73re
 .crit-text { display: flex; flex-direction: column; gap: 0.1rem; }
 .crit-desc { font-size: 0.73rem; color: #c9d1d9; }
 .crit-just { font-size: 0.7rem; color: #8b949e; font-style: italic; }
+.delta { font-size: 0.68rem; font-weight: 700; margin-left: 0.4rem;
+          padding: 0.08rem 0.3rem; border-radius: 3px; font-variant-numeric: tabular-nums; }
+.delta.pos     { color: #3fb950; background: #0f2b1a; }
+.delta.neg     { color: #f85149; background: #2d1010; }
+.delta.neutral { color: #484f58; background: #161b27; }
 .footer { text-align: center; padding: 2rem; font-size: 0.72rem; color: #21262d; }
 """
 
@@ -556,6 +563,8 @@ def generate_html(
     skill: str,
     criteria_descriptions: dict,
     agent_summary: str = "",
+    judge_model: str = "",
+    history: dict = None,
 ) -> str:
     total     = len(results)
     passed    = sum(1 for r in results if r["verdict"] == "PASS")
@@ -600,13 +609,25 @@ def generate_html(
         block_pct = _block_pct_map(r["scoring"].get("blocks", []))
         mini_b    = _mini_blocks(tc.get("scoring_blocks", []), block_pct)
 
+        prev_score = (history or {}).get(tc["id"])
+        if prev_score is not None and tc["type"] == "generate":
+            delta = sc - prev_score
+            if delta > 0:
+                delta_html = f'<span class="delta pos">+{delta}</span>'
+            elif delta < 0:
+                delta_html = f'<span class="delta neg">{delta}</span>'
+            else:
+                delta_html = '<span class="delta neutral">±0</span>'
+        else:
+            delta_html = ""
+
         rows += (
             f'<tr class="tc-row" data-tc="{tc["id"]}">'
             f'<td><strong>{tc["id"]}</strong></td>'
             f'<td>{tc["description"]}</td>'
             f'<td>{type_badge}</td>'
             f'<td>{mini_b}</td>'
-            f'<td>{_bar(sc)}</td>'
+            f'<td>{_bar(sc)}{delta_html}</td>'
             f'<td>{badge}</td>'
             f'<td><span class="time-chip">{elapsed}s</span></td>'
             f'</tr>'
@@ -701,7 +722,7 @@ def generate_html(
 
 <div class="header">
   <h1>Skill Eval Report — {skill}</h1>
-  <div class="sub">Gerado em {timestamp} &nbsp;|&nbsp; Modelo: {MODEL}</div>
+  <div class="sub">Gerado em {timestamp} &nbsp;|&nbsp; Skill: {MODEL}{f' &nbsp;|&nbsp; Judge: <span style="color:#d29922">{judge_model}</span>' if judge_model and judge_model != MODEL else ''}</div>
   <div class="kpi-row">
     <div class="kpi">
       <div class="kpi-label">Aprovados / Total</div>
@@ -800,10 +821,21 @@ def main():
     tc_order = {tc["id"]: i for i, tc in enumerate(test_cases)}
     workers  = min(args.workers, len(test_cases))
 
+    # Load last run from history for delta display
+    history_path = eval_dir / "history.jsonl"
+    prev_scores: dict = {}
+    if history_path.exists():
+        try:
+            last_line = history_path.read_text(encoding="utf-8").strip().splitlines()[-1]
+            prev_scores = json.loads(last_line).get("tcs", {})
+        except Exception:
+            pass
+
     client        = build_client()
     system_prompt = build_system_prompt(args.skill)
 
-    print(f"\nSkill Eval Runner — skill: {args.skill} | {len(test_cases)} TC(s) | modelo: {MODEL} | workers: {workers}")
+    judge_label = f" | judge: {JUDGE_MODEL}" if JUDGE_MODEL != MODEL else ""
+    print(f"\nSkill Eval Runner — skill: {args.skill} | {len(test_cases)} TC(s) | modelo: {MODEL}{judge_label} | workers: {workers}")
     print("-" * 70)
 
     results    = []
@@ -813,7 +845,7 @@ def main():
         future_to_tc = {
             executor.submit(
                 _run_one_tc, tc, client, system_prompt, rubric,
-                eval_dir, gen_dir, print_lock, args.verbose
+                eval_dir, gen_dir, print_lock, args.verbose, JUDGE_MODEL
             ): tc
             for tc in test_cases
         }
@@ -855,14 +887,39 @@ def main():
         agent_summary = generate_agent_summary(client, results)
         print("OK\n")
 
-    timestamp   = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html        = generate_html(results, timestamp, args.skill, criteria_desc, agent_summary)
+    ts_iso  = datetime.now().isoformat(timespec="seconds")
+    ts_disp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # Persist run to history.jsonl (append)
+    if not args.tc:  # só salva histórico em runs completos
+        history_entry = {
+            "ts":          ts_iso,
+            "skill_model": MODEL,
+            "judge_model": JUDGE_MODEL,
+            "tcs":         {r["tc"]["id"]: r["score"] for r in results},
+            "avg_gen":     round(sum(r["score"] for r in gen_res) / len(gen_res)) if gen_res else None,
+            "rej_pass":    rej_pass,
+            "rej_total":   len(rej_res),
+        }
+        with history_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(history_entry, ensure_ascii=False) + "\n")
+        print(f"Historico: {history_path}")
+
+    html = generate_html(
+        results, ts_disp, args.skill, criteria_desc, agent_summary,
+        judge_model=JUDGE_MODEL,
+        history=prev_scores if not args.tc else None,
+    )
     report_path = eval_dir / "report.html"
     report_path.write_text(html, encoding="utf-8")
     print(f"Relatorio: {report_path}")
 
     if not args.no_browser:
         webbrowser.open(report_path.as_uri())
+
+    # Exit code non-zero for CI gates
+    if passed < len(results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,68 @@
+name: Skill Eval
+
+on:
+  push:
+    paths:
+      - '.claude/skills/**'
+      - 'evals/**/rubric.json'
+      - 'evals/**/test_cases.json'
+      - 'scorer.py'
+      - 'run_eval.py'
+  pull_request:
+    paths:
+      - '.claude/skills/**'
+      - 'evals/**/rubric.json'
+      - 'evals/**/test_cases.json'
+  workflow_dispatch:
+    inputs:
+      skill:
+        description: 'Skill to evaluate (leave blank to run all)'
+        required: false
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run skill evals
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SKILL_MODEL: ${{ vars.SKILL_MODEL || 'claude-sonnet-4-5' }}
+          JUDGE_MODEL: ${{ vars.JUDGE_MODEL || 'claude-opus-4-5' }}
+        run: |
+          set -e
+          TARGET="${{ github.event.inputs.skill }}"
+
+          if [ -n "$TARGET" ]; then
+            echo "=== Evaluating: $TARGET ==="
+            python run_eval.py --skill "$TARGET" --no-browser --no-summary
+          else
+            SKILLS=$(ls -d evals/*/ 2>/dev/null | xargs -I{} basename {} || true)
+            if [ -z "$SKILLS" ]; then
+              echo "No skills found in evals/ — nothing to evaluate."
+              exit 0
+            fi
+            FAILED=0
+            for skill in $SKILLS; do
+              echo "=== Evaluating: $skill ==="
+              python run_eval.py --skill "$skill" --no-browser --no-summary || FAILED=1
+            done
+            exit $FAILED
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-reports-${{ github.run_number }}
+          path: evals/**/report.html
+          if-no-files-found: ignore
