@@ -12,7 +12,7 @@ Glob(".claude/skills/<nome-da-skill>/*")
 ```
 
 Arquivos esperados:
-- `SKILL.md` — definição principal: objetivo, DoR, raciocínio encadeado, formato de saída
+- `SKILL.md` — definição principal: objetivo, pré-condições (DoR), raciocínio encadeado, formato de saída
 - `examples.md` — exemplos few-shot que calibram o comportamento (entradas ricas, parciais, ambíguas)
 - `patterns.md` — guard rails e comportamentos de borda (o que é proibido, o que fazer em situações inesperadas)
 
@@ -24,7 +24,7 @@ Se ainda não existir, crie-o antes de rodar qualquer eval.
 ## Ordem obrigatória de leitura
 
 1. `Read(".claude/skills/<skill>/SKILL.md")`
-   → Extraia: DoR (pré-condições), `negative_triggers`, formato de saída, passos do raciocínio encadeado
+   → Extraia: pré-condições (DoR = Definition of Ready), `negative_triggers`, formato de saída, passos do raciocínio encadeado
 
 2. `Read(".claude/skills/<skill>/examples.md")`
    → Calibra o comportamento para inputs ricos, parciais e ambíguos

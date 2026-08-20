@@ -54,6 +54,9 @@ def main():
     for h in hits:
         print(f"   · {h}", file=sys.stderr)
     print("", file=sys.stderr)
+    print("   Por quê: outputs de eval (generated/, report.html, history.jsonl, .judge_cache.json)", file=sys.stderr)
+    print("   são gitignored por design — contêm dados de run, não código-fonte do projeto.", file=sys.stderr)
+    print("", file=sys.stderr)
     print("   Adicione arquivos individualmente, por exemplo:", file=sys.stderr)
     print("     git add run_eval.py scorer.py CLAUDE.md .gitignore", file=sys.stderr)
     print("", file=sys.stderr)

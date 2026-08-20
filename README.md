@@ -107,9 +107,13 @@ Make sure you're in the `skill-evaluator/` root. The hooks and rules only activa
 
 ### Step 2 — Run the bootstrapper
 
+In Claude Code's **chat** (not the terminal), type:
+
 ```
 /setup-skill-eval
 ```
+
+> Skills are invoked in the chat interface with `/skill-name`. They are not terminal commands.
 
 Paste your context when prompted — a description of the skill, sample inputs, what the output should look like, what the skill should refuse to do.
 
@@ -445,12 +449,13 @@ Manual invocation in Claude Code: `/<name>`
     setup-skill-eval/      ← /setup-skill-eval: bootstraps a new eval from scratch
     debug-tc/              ← /debug-tc: diagnoses a failing TC
     add-tc/                ← /add-tc: guided creation of new test cases
-  rules/
+  rules/                   ← read by Claude automatically via CLAUDE.md → Navigation Rules table
     skill-navigation.md    ← how to find and read skill files
     eval-navigation.md     ← how to navigate rubric, TCs, inputs, expected
     find-patterns.md       ← Glob/Grep/Read quick reference for this project
     before-edit-framework.md ← what to read before touching run_eval.py or scorer.py
     read-results.md        ← how to read history.jsonl and generated outputs
+    ⚠ Adding a new rule file? Also add it to the Navigation Rules table in CLAUDE.md.
   hooks/
     post_write_checks.py   ← validates rubric.json, test_cases.json, .py syntax, SKILL.md
     guard_git_add.py       ← blocks git add of eval runtime outputs

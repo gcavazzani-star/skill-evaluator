@@ -108,7 +108,7 @@ Read(".claude/skills/<skill>/SKILL.md")
 ```
 
 Verifique se o output segue o formato de saída definido na skill.
-Para TCs de rejeição, verifique o `negative_triggers` e as regras DoR.
+Para TCs de rejeição, verifique o `negative_triggers` e as pré-condições (DoR) da skill.
 
 ---
 
@@ -132,7 +132,7 @@ Com base nos dados coletados, produza o diagnóstico no formato abaixo.
 - **<ID do critério>** (<score>/10) — <o que estava sendo avaliado> → <o que o output fez de errado>
 
 [Para TCs de rejeição:]
-- **<critério B_X>** — a skill <gerou / não recusou / respondeu parcialmente> quando deveria <recusar / redirecionar>
+- **<criterion-id>** — a skill <gerou / não recusou / respondeu parcialmente> quando deveria <recusar / redirecionar>
 
 ---
 
@@ -152,6 +152,13 @@ Com base nos dados coletados, produza o diagnóstico no formato abaixo.
 1. [Ação concreta — ex: "Adicionar ao SKILL.md, seção Passo 3, a instrução explícita de que..."]
 2. [Ação concreta — ex: "Reformular critério X2 da rubrica de '...' para '...' para reduzir ambiguidade"]
 3. [Ação concreta — ex: "Adicionar ao input a informação Y que está ausente e impede a avaliação correta do critério X"]
+
+---
+
+**Para re-testar após aplicar as correções:**
+```
+python run_eval.py --skill <skill> --tc <TC_ID> --no-browser --no-summary
+```
 ```
 
 ---

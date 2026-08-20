@@ -79,11 +79,11 @@ Permite reutilizar ou adaptar um input existente se for similar ao cenário dese
 Com base no comportamento a ser testado:
 
 **`generate`** — a skill DEVE produzir um output estruturado
-- Use quando: input válido e suficiente (DoR atendida), skill deve gerar documento/análise/artefato
+- Use quando: input válido e suficiente (pré-condições da skill atendidas), skill deve gerar documento/análise/artefato
 - Blocos: selecione os `generate_blocks` relevantes (não todos — apenas os que o cenário exercita)
 
 **`reject`** — a skill NÃO deve gerar output
-- Use quando: negative trigger ativado, DoR não atendida, input inválido
+- Use quando: negative trigger ativado, pré-condições não atendidas, input inválido
 - Bloco: selecione exatamente UM critério de `reject_criteria`
 
 ### Passo 5 — Gerar o conteúdo do input

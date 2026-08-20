@@ -37,6 +37,9 @@ TOKEN       = os.environ.get("ANTHROPIC_API_KEY")
 MODEL       = os.environ.get("SKILL_MODEL", "anthropic.claude-4-6-sonnet")
 JUDGE_MODEL = os.environ.get("JUDGE_MODEL", MODEL)
 
+if not TOKEN:
+    sys.exit("ERRO: ANTHROPIC_API_KEY não configurada.\nCopie .env.example para .env e preencha com sua chave.")
+
 BASE_DIR  = Path(__file__).parent
 EVALS_DIR = BASE_DIR / "evals"
 SKILL_DIR = BASE_DIR / ".claude" / "skills"
@@ -954,9 +957,6 @@ def main():
     parser.add_argument("--no-summary", action="store_true", help="Pula analise do agente")
     args = parser.parse_args()
 
-    if not TOKEN:
-        print("ERRO: ANTHROPIC_API_KEY nao configurada. Crie um arquivo .env baseado em .env.example")
-        sys.exit(1)
 
     eval_dir  = _eval_dir(args.skill)
     skill_dir = _skill_dir(args.skill)
